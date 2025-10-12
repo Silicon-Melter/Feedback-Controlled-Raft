@@ -2,13 +2,13 @@
 #include <RCChannels.h>
 
 RCChannels rc;
-Servo esc1, esc2;
+Servo esc1, esc2;  
 
 const int ESC_MIN_US       = 1000;
 const int ESC_MAX_US       = 2000;
-int ESC1_NEUTRAL_US        = 1500;   // tweak until esc1 stops at neutral
-int ESC2_NEUTRAL_US        = 1500;   // tweak until esc2 stops at neutral
-const int ESC_NEUTRAL_DB_US = 10;    // deadband ±10us around neutral
+int ESC1_NEUTRAL_US        = 1500;
+int ESC2_NEUTRAL_US        = 1460;
+const int ESC_NEUTRAL_DB_US = 10;
 
 bool armed = false;  // start disarmed for safety
 float steering = 0.8;
