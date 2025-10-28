@@ -41,6 +41,13 @@ int8_t throttle; // CH2 = throttle
 int8_t mode; // CH5 = MAN/AUTO
 int8_t kill; // CH6 = arm/disarm
 
+// ===== Aux DC motor (H-bridge) on pins 10/11, driven by CH3 =====
+const uint8_t AUX_CCW_PIN     = 10;   // drive this for CCW
+const uint8_t AUX_CW_PIN      = 11;   // drive this for CW
+const uint8_t AUX_MIN_START   = 30;   // minimum PWM to overcome stiction
+const uint8_t AUX_MAX_PWM     = 255;  // cap
+int8_t ch3_aux = 0;                   // CH3 = aux motor command (-100..100)
+
 // Convert -100..100 (%) to microseconds around a given neutral
 static inline int pctToPwmWithNeutral(int pct, int neutral_us) {
   int span = (pct >= 0) ? (ESC_MAX_US - neutral_us) : (neutral_us - ESC_MIN_US);
@@ -100,13 +107,34 @@ void getData(){
 void velControlSetup(){
   vc.begin(ESC1_NEUTRAL_US, ESC2_NEUTRAL_US);
   vc.setMaxVel(1.20f, 1.50f);        // [m/s], [rad/s]
-  vc.setGainsV(0.90f, 0.60f, 0.05f); // linear PID
-  vc.setGainsW(0.80f, 0.40f, 0.04f); // angular PID
+  vc.setGainsV(10.0f, 0.0f, 0.0f); // linear PID
+  vc.setGainsW(1.0f, 0.0f, 0.0f); // angular PID
   vc.setNeutralDeadbandUs(ESC_NEUTRAL_DB_US);
   vc.setEscBoundsUs(ESC_MIN_US, ESC_MAX_US);
   vc.setDerivativeAlpha(0.15f);      // derivative smoothing
   vc.setDtFallback(0.02f);           // 50 Hz loop fallback
   vc.resetTiming();
+}
+
+static inline void driveAuxMotor(int8_t cmdPercent) {
+  // cmdPercent: -100..100  (>0 → CCW, <0 → CW)
+  int mag = abs(cmdPercent);
+  int pwm = map(mag, 0, 100, 0, AUX_MAX_PWM);
+  if (pwm > 0 && pwm < AUX_MIN_START) pwm = AUX_MIN_START;
+
+  if (cmdPercent > 0) {
+    // CCW
+    analogWrite(AUX_CCW_PIN, pwm);
+    analogWrite(AUX_CW_PIN,  0);
+  } else if (cmdPercent < 0) {
+    // CW
+    analogWrite(AUX_CCW_PIN, 0);
+    analogWrite(AUX_CW_PIN,  pwm);
+  } else {
+    // stop
+    analogWrite(AUX_CCW_PIN, 0);
+    analogWrite(AUX_CW_PIN,  0);
+  }
 }
 
 void setup() {
@@ -140,6 +168,12 @@ void setup() {
   velControlSetup();
   Serial.println(F("VelControl initialized."));
 
+  // Aux DC motor pins
+  pinMode(AUX_CCW_PIN, OUTPUT);
+  pinMode(AUX_CW_PIN,  OUTPUT);
+  analogWrite(AUX_CCW_PIN, 0);
+  analogWrite(AUX_CW_PIN,  0);
+
   Serial.println(F("🛑 ESCs disarmed. Flip CH6 high to arm..."));
   delay(2000);
 }
@@ -154,6 +188,7 @@ void loop() {
   // 2) Read RC channels (scaled: -100..100 with deadband)
   steer    = rc.readScaled(0); // CH1 = steering
   throttle = rc.readScaled(1); // CH2 = throttle
+  ch3_aux  = rc.readScaled(2); // CH3 = aux motor
   mode     = rc.readScaled(4); // CH5 = MAN/AUTO
   kill     = rc.readScaled(5); // CH6 = arm/disarm
 
@@ -177,6 +212,7 @@ void loop() {
   if (!armed) {
     esc1.writeMicroseconds(ESC1_NEUTRAL_US);
     esc2.writeMicroseconds(ESC2_NEUTRAL_US);
+    driveAuxMotor(0);
     delay(20);
     return;
   }
@@ -202,6 +238,12 @@ void loop() {
     Serial.print(F("  L_PWM=")); Serial.print(leftPWM);
     Serial.print(F("  R_PWM=")); Serial.println(rightPWM);
   }
+
+  // 6.5) Drive Aux DC motor from CH3 (only when ARMED)
+  driveAuxMotor(ch3_aux);   // >0 CCW, <0 CW
+  Serial.print(F("[AUX] CH3=")); Serial.print(ch3_aux);
+  Serial.print(F("  PWM="));
+  Serial.println(map(abs(ch3_aux), 0, 100, 0, AUX_MAX_PWM));
 
   // 7) Apply to ESCs
   esc1.writeMicroseconds(leftPWM);
