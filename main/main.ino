@@ -1,129 +1,75 @@
 #include <Servo.h>
 #include <RCChannels.h>
-#include <RCStabilizer.h>
 #include <RPilink.h>
 #include <VelControl.h>
 
+/* ========= ESC pins / limits / neutrals ========= */
+Servo escL, escR;
+const int PIN_ESC_L = 2;
+const int PIN_ESC_R = 3;
+
+const int ESC_MIN_US  = 1000;
+const int ESC_MAX_US  = 2000;
+int ESC_NEU_L_US      = 1430;
+int ESC_NEU_R_US      = 1400;
+const int ESC_NEU_DB  = 10;
+
+/* ========= AUX DC motor pins (H-bridge) ========= */
+const int AUX_CCW_PIN   = 10;   // PWM
+const int AUX_CW_PIN    = 11;   // PWM
+const int AUX_MAX_PWM   = 255;  // 8-bit analogWrite
+const int AUX_MIN_START = 20;   // overcome stiction; tune as needed
+
+/* ========= RC channel indices ========= */
+const uint8_t CH_STEER = 0;  // shared: steer (MANUAL) | yaw-trim rate (AUTO)
+const uint8_t CH_THR   = 1;  // throttle
+const uint8_t CH_AUX   = 2;  // aux motor command (-100..100)
+const uint8_t CH_MODE  = 4;  // MAN/AUTO (<=20 manual)
+const uint8_t CH_KILL  = 5;  // arm/disarm (>=80 arm, <=20 disarm)
+
+/* ========= Objects ========= */
 RCChannels rc;
-RCStabilizer stab;
-RPilink link;
+RPilink    link;
 VelControl vc;
 
-Servo esc1, esc2;  // Left, Right
+/* ========= State ========= */
+bool  armed  = false;
+bool  manual = true;
+float yaw_set_deg = 0.0f;
+bool  yaw_seeded  = false;
 
-// ===== ESC timing =====
-const int ESC_MIN_US         = 1000;
-const int ESC_MAX_US         = 2000;
-int       ESC1_NEUTRAL_US    = 1430;  // left
-int       ESC2_NEUTRAL_US    = 1400;  // right (your measured neutral)
-const int ESC_NEUTRAL_DB_US  = 0;    // snap-to-neutral deadband
+int8_t steer = 0, throttle = 0, ch3_aux = 0, mode = 0, kill = 0;
+int L_us = 1500, R_us = 1500;
+bool piFresh = false;
+unsigned long yawTrim_prev_ms = 0;
 
+/* ========= Helpers ========= */
+static inline float wrapDeg180(float a) {
+  while (a > 180.0f) a -= 360.0f;
+  while (a < -180.0f) a += 360.0f;
+  return a;
+}
 
-bool  armed  = false;   // start disarmed for safety
-bool  manual = true;    // CH5 selects MAN/AUTO
-float Ksteering = 0.8;
-
-// ===== Sensors / setpoints =====
-float roll_deg = 0.0f;
-float lin_vel  = 0.0f;
-float ang_vel  = 0.0f;
-
-// ===== Outputs =====
-int leftPWM  = ESC1_NEUTRAL_US;
-int rightPWM = ESC2_NEUTRAL_US;
-int AUTO_leftPWM  = ESC1_NEUTRAL_US;
-int AUTO_rightPWM = ESC2_NEUTRAL_US;
-
-// ===== Controller =====
-int8_t steer; // CH1 = steering
-int8_t throttle; // CH2 = throttle
-int8_t mode; // CH5 = MAN/AUTO
-int8_t kill; // CH6 = arm/disarm
-
-// ===== Aux DC motor (H-bridge) on pins 10/11, driven by CH3 =====
-const uint8_t AUX_CCW_PIN     = 10;   // drive this for CCW
-const uint8_t AUX_CW_PIN      = 11;   // drive this for CW
-const uint8_t AUX_MIN_START   = 30;   // minimum PWM to overcome stiction
-const uint8_t AUX_MAX_PWM     = 255;  // cap
-int8_t ch3_aux = 0;                   // CH3 = aux motor command (-100..100)
-
-// Convert -100..100 (%) to microseconds around a given neutral
 static inline int pctToPwmWithNeutral(int pct, int neutral_us) {
   int span = (pct >= 0) ? (ESC_MAX_US - neutral_us) : (neutral_us - ESC_MIN_US);
   long us  = (long)neutral_us + ((long)pct * span) / 100;
-  if (abs((int)us - neutral_us) <= ESC_NEUTRAL_DB_US) us = neutral_us;  // snap-to-neutral
+  if (abs((int)us - neutral_us) <= ESC_NEU_DB) us = neutral_us;
   return (int)constrain(us, ESC_MIN_US, ESC_MAX_US);
 }
-
-// ===== Stabilizer bring-up =====
-void stabStartUp(){
-  Serial.println(F("Starting Stabilizer"));
-
-  RCStabilizer::Pins pins;        // use defaults from the library unless you need to override
-  pins.escPin = 7;
-  pins.motorA = 12;
-  pins.motorB = 13;
-  pins.limitCCW = 24;    // limit switch CCW
-  pins.limitCW  = 25;    // limit switch CW
-  pins.limitActiveLow = true;
-
-  RCStabilizer::PID pid;          // Kp,Ki,Kd (your values carried over)
-  pid.Kp = 2.0f; pid.Ki = 0.0f; pid.Kd = 0.0f;
-  pid.I_min = -50.0f; pid.I_max = 50.0f;
-
-  RCStabilizer::Limits lim;
-  lim.roll_deadband   = 2.0f;
-  lim.rate_cmd_max    = 120.0f;
-  lim.rate_cmd_slew   = 800.0f;
-
-  RCStabilizer::RateToPwm r2p;
-  r2p.k_rate = 1.6f;
-  r2p.pwm_min_start = 1;
-  r2p.pwm_max = 255;
-  r2p.invertOutput = true;
-
-  RCStabilizer::EscProfile esc;
-  esc.pwmMin = 1000; esc.pwmMax = 2000;
-  esc.holdAfter = 1300;
-  esc.rampStart = 1000; esc.rampEnd = 1300;
-  esc.stepUs = 5; esc.stepMs = 200; esc.preArmMs = 3000;
-
-  stab.begin(&pins, &pid, &lim, &r2p, &esc);
-  stab.armESCSlow();           // gentle ESC ramp
-  stab.escHoldAtConfigured();  // hold after arming
-  Serial.println(F("RCStabilizer ready."));
+static inline float yawTrimRateFromStick(int8_t stick_pct) { return ((float)stick_pct) / 5.0f; }
+float stepDt(unsigned long &t_prev_ms, float fallback = 0.02f) {
+  unsigned long now = millis();
+  float dt = (t_prev_ms == 0) ? fallback : (now - t_prev_ms) * 0.001f;
+  if (dt <= 0.0005f || dt > 0.20f) dt = fallback;
+  t_prev_ms = now;
+  return dt;
+}
+void holdNeutral() {
+  escL.writeMicroseconds(ESC_NEU_L_US); L_us = ESC_NEU_L_US;
+  escR.writeMicroseconds(ESC_NEU_R_US); R_us = ESC_NEU_R_US;
 }
 
-// ===== RPilink ingest =====
-void getData(){
-  if (link.poll()) {
-    const RPilink::Packet& p = link.last();
-    // Only accept new data if it’s “fresh” (e.g., <= 300 ms old)
-    if (p.fresh(300)) {
-      roll_deg = p.roll;
-      lin_vel  = p.v;
-      ang_vel  = p.w;
-      // If the RPi is commanding ESC microseconds directly for AUTO:
-      AUTO_leftPWM  = constrain(p.lpwm, ESC_MIN_US, ESC_MAX_US);
-      AUTO_rightPWM = constrain(p.rpwm, ESC_MIN_US, ESC_MAX_US);
-    }
-    // else: keep last known values (fail-safe)
-  }
-}
-
-// ===== VelControl =====
-void velControlSetup(){
-  vc.begin(ESC1_NEUTRAL_US, ESC2_NEUTRAL_US);
-  vc.setMaxVel(0.3f, 0.50f);        // [m/s], [rad/s]
-  vc.setGainsV(10.0f, 0.0f, 0.0f); // linear PID
-  vc.setGainsW(40.0f, 0.0f, 0.0f); // angular PID
-  vc.setNeutralDeadbandUs(ESC_NEUTRAL_DB_US);
-  vc.setEscBoundsUs(ESC_MIN_US, ESC_MAX_US);
-  vc.setDerivativeAlpha(0.15f);      // derivative smoothing
-  vc.setDtFallback(0.02f);           // 50 Hz loop fallback
-  vc.resetTiming();
-}
-
+/* ========= AUX motor driver (your function) ========= */
 static inline void driveAuxMotor(int8_t cmdPercent) {
   // cmdPercent: -100..100  (>0 → CCW, <0 → CW)
   int mag = abs(cmdPercent);
@@ -145,134 +91,135 @@ static inline void driveAuxMotor(int8_t cmdPercent) {
   }
 }
 
-void setup() {
-  Serial.begin(115200);
-  while (!Serial) {}  // wait for USB, if applicable
-
-  Serial.println(F("\n=== Raft Controller ==="));
-  Serial.println(F("CH1=steer, CH2=throttle, CH5=mode, CH6=kill"));
-
-  // RC receiver (FlySky iBUS) on Serial1
-  rc.begin(Serial1);
-  Serial.println(F("FlySky iBUS started."));
-
-  // RPi telemetry/control on USB Serial
-  link.begin(Serial);
-  Serial.println(F("RPilink started."));
-
-  // ESC signal pins (adjust as needed)
-  esc1.attach(2);  // Left motor ESC signal pin
-  esc2.attach(3);  // Right motor ESC signal pin
-  // Safe startup
-  esc1.writeMicroseconds(ESC1_NEUTRAL_US);
-  esc2.writeMicroseconds(ESC2_NEUTRAL_US);
-  Serial.println(F("ESC startup"));
-
-  // Stabilizer (flywheel) startup
-  //stabStartUp();
-  // Serial.println(F("Stabilizer ready."));
-
-  // Vel startup
-  velControlSetup();
-  Serial.println(F("VelControl initialized."));
-
-  // Aux DC motor pins
-  pinMode(AUX_CCW_PIN, OUTPUT);
-  pinMode(AUX_CW_PIN,  OUTPUT);
-  analogWrite(AUX_CCW_PIN, 0);
-  analogWrite(AUX_CW_PIN,  0);
-
-  Serial.println(F("🛑 ESCs disarmed. Flip CH6 high to arm..."));
-  delay(2000);
+/* ========= Pi data poll wrapper ========= */
+void getData() {
+  link.poll();
+  piFresh = link.last().fresh(500);
 }
 
+/* ===================== setup ===================== */
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {}
+
+  rc.begin(Serial1);
+  link.begin(Serial);
+
+  escL.attach(PIN_ESC_L);
+  escR.attach(PIN_ESC_R);
+  holdNeutral();
+
+  // AUX motor pins
+  pinMode(AUX_CCW_PIN, OUTPUT);
+  pinMode(AUX_CW_PIN,  OUTPUT);
+  driveAuxMotor(0);  // make sure it's stopped
+
+  vc.begin(ESC_NEU_L_US, ESC_NEU_R_US);
+  vc.setEscBoundsUs(ESC_MIN_US, ESC_MAX_US);
+  vc.setNeutralDeadbandUs(ESC_NEU_DB);
+  vc.setGainsV(400.0f, 0.0f, 0.0f);
+  vc.setGainsW(5.0f, 0.05f, 0.1f);
+  vc.setMaxVel(0.3f, 1.5f);
+  vc.setDtFallback(0.02f);
+  vc.setDtClamp(0.001f, 0.20f);
+
+  Serial.println(F("Ready."));
+}
+
+/* ====================== loop ====================== */
 void loop() {
   // 1) Read inbound data
   getData();
 
-  // update stabilizer
-  //stab.update(roll_deg);   // consume roll_deg from RPilink
-
-  // 2) Read RC channels (scaled: -100..100 with deadband)
-  steer    = rc.readScaled(0); // CH1 = steering
+  // 2) Read RC channels
+  steer    = rc.readScaled(0); // CH1 = steering (or yaw-trim in AUTO)
   throttle = rc.readScaled(1); // CH2 = throttle
-  ch3_aux  = rc.readScaled(2); // CH3 = aux motor
+  ch3_aux  = rc.readScaled(2); // CH3 = aux motor (-100..100)
   mode     = rc.readScaled(4); // CH5 = MAN/AUTO
   kill     = rc.readScaled(5); // CH6 = arm/disarm
 
-  // 3) Arm/disarm logic (CH6 only)
+  // 3) Arm/disarm (exact thresholds)
   if (!armed && kill >= 80) {
     armed = true;
+    yaw_seeded = false;
+    vc.resetTiming();
     Serial.println(F("✅ ESCs ARMED"));
   } else if (armed && kill <= 20) {
     armed = false;
     Serial.println(F("🛑 ESCs DISARMED"));
   }
 
-  // 4) Mode selection (CH5 only)
-  bool want_manual = (mode <= 20);    // low → Manual, high → Auto (tune thresholds if 3-pos switch)
+  // 4) Mode selection (exact threshold)
+  bool want_manual = (mode <= 20);    // low → Manual, high → Auto
   if (manual != want_manual) {
     manual = want_manual;
     Serial.println(manual ? F("Mode: MANUAL") : F("Mode: AUTO"));
   }
 
-  // 5) If disarmed, hold neutrals and exit quickly
+  // If disarmed, hold neutrals and stop aux
   if (!armed) {
-    esc1.writeMicroseconds(ESC1_NEUTRAL_US);
-    esc2.writeMicroseconds(ESC2_NEUTRAL_US);
+    holdNeutral();
     driveAuxMotor(0);
+    Serial.print(F("DISARM L=")); Serial.print(L_us);
+    Serial.print(F(" R="));       Serial.println(R_us);
     delay(20);
     return;
   }
 
-  // 6) Control based on mode
-  if (!manual) {
-    // Auto: use RPilink pwm commands
-    //leftPWM  = AUTO_leftPWM;
-    //rightPWM = AUTO_rightPWM;
-    //Serial.print(F("[AUTO] Using RPi PWM L=")); Serial.print(leftPWM);
-    //Serial.print(F("  R=")); Serial.println(rightPWM);
-
-    //raw manual
-    int steerMix = steer * Ksteering;  // reduce steering sensitivity
-    int leftPct  = constrain(throttle + steerMix, -100, 100);
-    int rightPct = constrain(throttle - steerMix, -100, 100);
-
-    leftPWM  = pctToPwmWithNeutral(leftPct,  ESC1_NEUTRAL_US);
-    rightPWM = pctToPwmWithNeutral(rightPct, ESC2_NEUTRAL_US);
-    Serial.print(F("[RAW] Using RAW PWM L=")); Serial.print(leftPWM);
-    Serial.print(F("  R=")); Serial.println(rightPWM);
-  } 
-  else {
-    // Manual: run velocity control using RC setpoints
-    vc.update(throttle, steer, lin_vel, ang_vel);
-    leftPWM  = vc.leftPWM();
-    rightPWM = vc.rightPWM();
-
-    Serial.print(F("[MANUAL PID] Thr=")); Serial.print(throttle);
-    Serial.print(F("  Steer=")); Serial.print(steer);
-    Serial.print(F("  v=")); Serial.print(lin_vel, 3);
-    Serial.print(F("  w=")); Serial.print(ang_vel, 3);
-    Serial.print(F("  L_PWM=")); Serial.print(leftPWM);
-    Serial.print(F("  R_PWM=")); Serial.println(rightPWM);
+  // Seed yaw target on first fresh yaw after arming
+  if (!yaw_seeded && piFresh) {
+    yaw_set_deg = wrapDeg180(link.last().yaw);
+    yaw_seeded  = true;
+    Serial.print(F("Yaw seeded at ")); Serial.print(yaw_set_deg, 2); Serial.println(F(" deg"));
   }
 
-  // 6.5) Drive Aux DC motor from CH3 (only when ARMED)
-  driveAuxMotor(ch3_aux);   // >0 CCW, <0 CW
-  Serial.print(F("[AUX] CH3=")); Serial.print(ch3_aux);
-  Serial.print(F("  PWM="));
-  Serial.println(map(abs(ch3_aux), 0, 100, 0, AUX_MAX_PWM));
+  // 5) ESC control
+  if (manual) {
+    driveAuxMotor(ch3_aux);
+    int leftPct  = constrain((int)throttle - (int)steer, -100, 100);
+    int rightPct = constrain((int)throttle + (int)steer, -100, 100);
+    L_us = pctToPwmWithNeutral(leftPct,  ESC_NEU_L_US);
+    R_us = pctToPwmWithNeutral(rightPct, ESC_NEU_R_US);
+    escL.writeMicroseconds(L_us);
+    escR.writeMicroseconds(R_us);
+  } else {
+    driveAuxMotor(ch3_aux);
+    float dtTrim = stepDt(yawTrim_prev_ms, 0.02f);
+    yaw_set_deg += -yawTrimRateFromStick(steer) * dtTrim;  // CH0 as setpoint rate
+    yaw_set_deg = wrapDeg180(yaw_set_deg);
 
-  // 7) Apply to ESCs
-  esc1.writeMicroseconds(leftPWM);
-  esc2.writeMicroseconds(rightPWM);
+    if (piFresh) {
+      float v_meas   = link.last().v;
+      float yaw_meas = link.last().yaw;
+      vc.updateYawAngle(throttle, yaw_set_deg, yaw_meas, v_meas);
+      L_us = vc.leftPWM();
+      R_us = vc.rightPWM();
+      escL.writeMicroseconds(L_us);
+      escR.writeMicroseconds(R_us);
+    } else {
+      int leftPct  = constrain((int)throttle - (int)steer, -100, 100);
+      int rightPct = constrain((int)throttle + (int)steer, -100, 100);
+      L_us = pctToPwmWithNeutral(leftPct,  ESC_NEU_L_US);
+      R_us = pctToPwmWithNeutral(rightPct, ESC_NEU_R_US);
+      escL.writeMicroseconds(L_us);
+      escR.writeMicroseconds(R_us);
+    }
+  }
 
-  // 8) Debug
-  Serial.print(F("[OUT] Armed=")); Serial.print(armed);
-  Serial.print(F("  Mode=")); Serial.print(manual ? F("MAN") : F("AUTO"));
-  Serial.print(F("  Roll=")); Serial.print(roll_deg, 2);
-  Serial.print(F("°  L=")); Serial.print(leftPWM);
-  Serial.print(F("  R=")); Serial.println(rightPWM);
-  Serial.println(F("--------------------------------"));
+  // 6) AUX motor (H-bridge) — ONLY when armed
+  driveAuxMotor(ch3_aux);
 
+  // 7) Debug: always print current ESC PWMs + AUX cmd
+  Serial.print(F("man="));   Serial.print(manual);
+  Serial.print(F(" arm="));  Serial.print(armed);
+  Serial.print(F(" thr="));  Serial.print(throttle);
+  Serial.print(F(" steer="));Serial.print(steer);
+  Serial.print(F(" aux="));  Serial.print(ch3_aux);
+  Serial.print(F(" yawSet=")); Serial.print(yaw_set_deg, 2);
+  Serial.print(F(" yaw="));  Serial.print(link.last().yaw, 2);
+  Serial.print(F(" v="));    Serial.print(link.last().v, 3);
+  Serial.print(F(" L="));    Serial.print(L_us);
+  Serial.print(F(" R="));    Serial.println(R_us);
+
+  delay(5); // ~200 Hz
 }
