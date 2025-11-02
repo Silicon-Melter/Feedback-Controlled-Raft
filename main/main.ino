@@ -14,15 +14,14 @@ Servo esc1, esc2;  // Left, Right
 // ===== ESC timing =====
 const int ESC_MIN_US         = 1000;
 const int ESC_MAX_US         = 2000;
-int       ESC1_NEUTRAL_US    = 1500;  // left
-int       ESC2_NEUTRAL_US    = 1460;  // right (your measured neutral)
-const int ESC_NEUTRAL_DB_US  = 10;    // snap-to-neutral deadband
+int       ESC1_NEUTRAL_US    = 1430;  // left
+int       ESC2_NEUTRAL_US    = 1400;  // right (your measured neutral)
+const int ESC_NEUTRAL_DB_US  = 0;    // snap-to-neutral deadband
 
 
 bool  armed  = false;   // start disarmed for safety
 bool  manual = true;    // CH5 selects MAN/AUTO
-
-float steering_gain = 0.8f;   // scales angular demand into differential mix
+float Ksteering = 0.8;
 
 // ===== Sensors / setpoints =====
 float roll_deg = 0.0f;
@@ -58,9 +57,18 @@ static inline int pctToPwmWithNeutral(int pct, int neutral_us) {
 
 // ===== Stabilizer bring-up =====
 void stabStartUp(){
+  Serial.println(F("Starting Stabilizer"));
+
   RCStabilizer::Pins pins;        // use defaults from the library unless you need to override
+  pins.escPin = 7;
+  pins.motorA = 12;
+  pins.motorB = 13;
+  pins.limitCCW = 24;    // limit switch CCW
+  pins.limitCW  = 25;    // limit switch CW
+  pins.limitActiveLow = true;
+
   RCStabilizer::PID pid;          // Kp,Ki,Kd (your values carried over)
-  pid.Kp = 0.2f; pid.Ki = 0.0f; pid.Kd = 0.0f;
+  pid.Kp = 2.0f; pid.Ki = 0.0f; pid.Kd = 0.0f;
   pid.I_min = -50.0f; pid.I_max = 50.0f;
 
   RCStabilizer::Limits lim;
@@ -76,8 +84,8 @@ void stabStartUp(){
 
   RCStabilizer::EscProfile esc;
   esc.pwmMin = 1000; esc.pwmMax = 2000;
-  esc.holdAfter = 1400;
-  esc.rampStart = 1200; esc.rampEnd = 1400;
+  esc.holdAfter = 1300;
+  esc.rampStart = 1000; esc.rampEnd = 1300;
   esc.stepUs = 5; esc.stepMs = 200; esc.preArmMs = 3000;
 
   stab.begin(&pins, &pid, &lim, &r2p, &esc);
@@ -106,9 +114,9 @@ void getData(){
 // ===== VelControl =====
 void velControlSetup(){
   vc.begin(ESC1_NEUTRAL_US, ESC2_NEUTRAL_US);
-  vc.setMaxVel(1.20f, 1.50f);        // [m/s], [rad/s]
+  vc.setMaxVel(0.3f, 0.50f);        // [m/s], [rad/s]
   vc.setGainsV(10.0f, 0.0f, 0.0f); // linear PID
-  vc.setGainsW(1.0f, 0.0f, 0.0f); // angular PID
+  vc.setGainsW(40.0f, 0.0f, 0.0f); // angular PID
   vc.setNeutralDeadbandUs(ESC_NEUTRAL_DB_US);
   vc.setEscBoundsUs(ESC_MIN_US, ESC_MAX_US);
   vc.setDerivativeAlpha(0.15f);      // derivative smoothing
@@ -161,8 +169,8 @@ void setup() {
   Serial.println(F("ESC startup"));
 
   // Stabilizer (flywheel) startup
-  stabStartUp();
-  Serial.println(F("Stabilizer ready."));
+  //stabStartUp();
+  // Serial.println(F("Stabilizer ready."));
 
   // Vel startup
   velControlSetup();
@@ -183,7 +191,7 @@ void loop() {
   getData();
 
   // update stabilizer
-  stab.update(roll_deg);   // consume roll_deg from RPilink
+  //stab.update(roll_deg);   // consume roll_deg from RPilink
 
   // 2) Read RC channels (scaled: -100..100 with deadband)
   steer    = rc.readScaled(0); // CH1 = steering
@@ -220,9 +228,19 @@ void loop() {
   // 6) Control based on mode
   if (!manual) {
     // Auto: use RPilink pwm commands
-    leftPWM  = AUTO_leftPWM;
-    rightPWM = AUTO_rightPWM;
-    Serial.print(F("[AUTO] Using RPi PWM L=")); Serial.print(leftPWM);
+    //leftPWM  = AUTO_leftPWM;
+    //rightPWM = AUTO_rightPWM;
+    //Serial.print(F("[AUTO] Using RPi PWM L=")); Serial.print(leftPWM);
+    //Serial.print(F("  R=")); Serial.println(rightPWM);
+
+    //raw manual
+    int steerMix = steer * Ksteering;  // reduce steering sensitivity
+    int leftPct  = constrain(throttle + steerMix, -100, 100);
+    int rightPct = constrain(throttle - steerMix, -100, 100);
+
+    leftPWM  = pctToPwmWithNeutral(leftPct,  ESC1_NEUTRAL_US);
+    rightPWM = pctToPwmWithNeutral(rightPct, ESC2_NEUTRAL_US);
+    Serial.print(F("[RAW] Using RAW PWM L=")); Serial.print(leftPWM);
     Serial.print(F("  R=")); Serial.println(rightPWM);
   } 
   else {
@@ -257,5 +275,4 @@ void loop() {
   Serial.print(F("  R=")); Serial.println(rightPWM);
   Serial.println(F("--------------------------------"));
 
-  delay(20);  // ~50 Hz loop
 }

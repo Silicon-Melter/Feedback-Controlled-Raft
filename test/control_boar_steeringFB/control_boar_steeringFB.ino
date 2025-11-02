@@ -7,7 +7,7 @@ Servo esc1, esc2;
 const int ESC_MIN_US       = 1000;
 const int ESC_MAX_US       = 2000;
 int ESC1_NEUTRAL_US        = 1500;
-int ESC2_NEUTRAL_US        = 1460;
+int ESC2_NEUTRAL_US        = 1500;
 const int ESC_NEUTRAL_DB_US = 10;
 
 bool armed = false;  // start disarmed for safety
